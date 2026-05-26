@@ -1,0 +1,149 @@
+# =============================================================================
+# Commodity Volatility Forecasting System
+# requirements.txt
+# Python >= 3.10
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# WEEK 1 — Data Ingestion & Storage
+# -----------------------------------------------------------------------------
+
+# HTTP requests for EIA API calls
+requests==2.31.0
+
+# Yahoo Finance — agricultural ETF proxies (WEAT, CORN)
+yfinance==0.2.40
+
+# FRED API — macro features (DXY, 10Y treasury yield)
+fredapi==0.5.2
+
+# Trading calendar — NYSE master calendar for date alignment
+pandas-market-calendars==4.3.1
+
+# Core data manipulation
+pandas==2.2.2
+numpy==1.26.4
+
+# Data validation — Great Expectations checks (date continuity, nulls, negative prices)
+great-expectations==0.18.15
+
+# Environment variable management — API key storage
+python-dotenv==1.0.1
+
+
+# -----------------------------------------------------------------------------
+# WEEK 2 — Feature Engineering
+# -----------------------------------------------------------------------------
+
+# Scientific computing — used in rolling window and annualization calculations
+scipy==1.13.0
+
+# Feature store serialization
+pyarrow==16.0.0     # fast parquet read/write for gold layer CSVs
+
+
+# -----------------------------------------------------------------------------
+# WEEK 3 — GARCH Baseline
+# -----------------------------------------------------------------------------
+
+# GARCH(1,1), EGARCH, GJR-GARCH fitting
+arch==6.3.0
+
+# Experiment tracking — log all models from Week 3 onward
+mlflow==2.13.0
+
+# Plotting — actual vs forecast RV, volatility term structure
+matplotlib==3.8.4
+seaborn==0.13.2
+
+
+# -----------------------------------------------------------------------------
+# WEEK 4 — LightGBM Model
+# -----------------------------------------------------------------------------
+
+# Main ML model
+lightgbm==4.3.0
+
+# Hyperparameter tuning — Optuna on validation set only
+optuna==3.6.1
+
+# SHAP feature importance analysis
+shap==0.45.0
+
+# Scikit-learn — metrics (MAE, RMSE), preprocessing utilities
+scikit-learn==1.4.2
+
+
+# -----------------------------------------------------------------------------
+# WEEK 5 — LSTM + Model Validation
+# -----------------------------------------------------------------------------
+
+# Deep learning — single-layer LSTM, sequence length 21 days
+torch==2.3.0
+
+# Progress bars — walk-forward validation loops
+tqdm==4.66.4
+
+# Jupyter — walk-forward validation notebook
+jupyter==1.0.0
+ipykernel==6.29.4
+
+
+# -----------------------------------------------------------------------------
+# WEEK 6 — LLM Risk Briefing Agent
+# -----------------------------------------------------------------------------
+
+# Anthropic API — claude-sonnet-4-20250514 for structured risk briefings
+anthropic==0.28.0
+
+
+# -----------------------------------------------------------------------------
+# WEEK 7 — FastAPI + Streamlit
+# -----------------------------------------------------------------------------
+
+# Production API server
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# Request validation — Pydantic models for API payloads
+pydantic==2.7.1
+
+# Frontend dashboard — calls FastAPI, not models directly
+streamlit==1.35.0
+
+# HTTP client — Streamlit → FastAPI calls
+httpx==0.27.0
+
+
+# -----------------------------------------------------------------------------
+# WEEK 8 — Docker Compose + Polish
+# -----------------------------------------------------------------------------
+
+# Linting — GitHub Actions ruff check
+ruff==0.4.4
+
+# Testing — pytest on API endpoints
+pytest==8.2.1
+pytest-asyncio==0.23.7      # async FastAPI endpoint tests
+httpx==0.27.0               # test client for FastAPI (already listed above)
+
+# PostgreSQL driver — MLflow backend store in Docker Compose
+psycopg2-binary==2.9.9
+
+# Logging
+loguru==0.7.2
+
+
+# -----------------------------------------------------------------------------
+# DEVELOPMENT UTILITIES (not required in production Docker image)
+# -----------------------------------------------------------------------------
+
+# Interactive development
+ipython==8.24.0
+
+# Type checking
+mypy==1.10.0
+
+# Pre-commit hooks
+pre-commit==3.7.1
