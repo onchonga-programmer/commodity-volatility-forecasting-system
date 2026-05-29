@@ -1,4 +1,117 @@
-#environments
+
+
+
+# ── Environment & Secrets ─────────────────────
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+
+# ── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.eggs/
+*.egg-info/
+dist/
+build/
+wheels/
+*.egg
+MANIFEST
+
+
+# ── Virtual Environments ──────────────────────
 venv/
-env/
 .venv/
+env/
+ENV/
+
+
+# ── Jupyter Notebooks ─────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+# Keep .ipynb files themselves — they are deliverables
+
+
+# ── Data — Raw & Intermediate ─────────────────
+# Never commit raw financial data to git
+# Use S3 / DVC for data versioning
+data/bronze/
+data/silver/
+data/gold/
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+!data/.gitkeep          # keeps the empty data/ folder tracked
+
+
+# ── MLflow ────────────────────────────────────
+mlruns/
+mlartifacts/
+mlflow.db
+
+
+# ── Model Artifacts ───────────────────────────
+models/
+*.pkl
+*.pickle
+*.joblib
+*.pt                    # PyTorch model weights
+*.pth
+*.onnx
+
+
+# ── Logs ──────────────────────────────────────
+logs/
+*.log
+*.log.*
+
+
+# ── OS & Editor Noise ─────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+
+# ── Testing & Coverage ────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.coveragerc
+
+
+# ── Docker ────────────────────────────────────
+# Keep Dockerfiles — exclude runtime volumes
+docker/volumes/
+postgres_data/
+
+
+# ── Great Expectations ────────────────────────
+# Keep suite definitions, exclude generated docs & checkpoints
+great_expectations/uncommitted/
+great_expectations/checkpoints/*.yml
+!great_expectations/checkpoints/.gitkeep
+
+
+# ── Optuna ────────────────────────────────────
+optuna_studies/
+*.db                    # SQLite study files
+
+
+# ── Misc ──────────────────────────────────────
+.cache/
+tmp/
+scratch/

@@ -40,7 +40,7 @@ python-dotenv==1.0.1
 scipy==1.13.0
 
 # Feature store serialization
-pyarrow==16.0.0     # fast parquet read/write for gold layer CSVs
+pyarrow==14.0.0     # fast parquet read/write for gold layer CSVs
 
 
 # -----------------------------------------------------------------------------
