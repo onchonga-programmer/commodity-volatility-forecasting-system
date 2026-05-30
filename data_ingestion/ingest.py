@@ -1,11 +1,10 @@
-
-
 # =============================================================================
 # IMPORTS
 # =============================================================================
 
 import argparse
 import os
+import random
 import sys
 import time
 from datetime import date, datetime
@@ -15,8 +14,7 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 import requests
-import yfinance as yf
-import great_expectations as gx
+import yfinance as yf      # used for CORN only — WEAT uses Stooq (see below)
 from dotenv import load_dotenv
 from fredapi import Fred
 from loguru import logger
@@ -41,9 +39,36 @@ EIA_SERIES = {
     "natgas": "NG.RNGWHHD.D",
 }
 
-# yfinance tickers
-YFINANCE_TICKERS = {
-    "weat": "WEAT",
+# ── Agricultural data source config ──────────────────────────────────────────
+#
+# WEAT → Stooq (stooq.com, no API key required)
+# -----------------------------------------------
+# WEAT executed a 1-for-5 reverse split on Nov 25 2025, which changed its
+# CUSIP number. This permanently breaks yfinance for WEAT — it cannot stitch
+# pre-split and post-split history across the CUSIP boundary, returning an
+# empty DataFrame regardless of yfinance version. ZW=F (the CBOT futures
+# fallback) is also broken in yfinance for the same underlying reason.
+# Stooq serves the same WEAT ETF OHLCV data reliably, for free, with no
+# authentication. Confirmed working as of May 2026.
+#
+# CORN → yfinance (yahoo finance)
+# --------------------------------
+# CORN has no CUSIP issue and downloads cleanly from yfinance after upgrading
+# to the latest version (confirmed working May 2026). Stays on yfinance.
+#
+# WHY back_adjust MATTERS FOR CORN:
+#   back_adjust=True retroactively rescales all historical prices relative to
+#   today's price, making log returns across any past split dates economically
+#   correct. Without it, a historical split creates a fake one-day return that
+#   the volatility model would learn as an extreme event.
+#
+STOOQ_CONFIG: dict[str, str] = {
+    # Stooq uses lowercase ticker + ".us" suffix for US-listed securities
+    "weat": "weat.us",
+}
+
+YFINANCE_CONFIG: dict[str, str] = {
+    # Standard Yahoo Finance tickers — verified working after yfinance upgrade
     "corn": "CORN",
 }
 
@@ -56,9 +81,22 @@ FRED_SERIES = {
 # Forward fill limit for calendar gaps (days)
 MAX_FILL_DAYS = 3
 
-# Retry configuration for API calls
-MAX_RETRIES   = 3
-RETRY_DELAY   = 2  # seconds between retries
+# Retry configuration
+MAX_RETRIES = 3
+
+# Base delay for non-rate-limit retries (seconds).
+# Actual wait = (2 ** attempt) + jitter — exponential backoff.
+BASE_RETRY_DELAY = 2
+
+# Multiplier applied on top of exponential backoff when a 429 is detected.
+# 429 = "Too Many Requests" — Yahoo is throttling us. Wait much longer.
+RATE_LIMIT_MULTIPLIER = 4
+
+try:
+    import great_expectations as gx
+except Exception as exc:
+    gx = None
+    GX_IMPORT_ERROR = exc
 
 # Storage paths
 DATA_ROOT = Path("data")
@@ -256,10 +294,11 @@ def pull_eia(series_id: str, name: str, start: str, end: str) -> pd.DataFrame:
             payload = response.json()
             break
         except requests.exceptions.RequestException as e:
-            logger.warning(f"EIA attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            wait = (BASE_RETRY_DELAY ** attempt) + random.uniform(0, 1)
+            logger.warning(f"EIA attempt {attempt}/{MAX_RETRIES} failed: {e}. Retrying in {wait:.1f}s...")
             if attempt == MAX_RETRIES:
                 raise RuntimeError(f"EIA pull failed after {MAX_RETRIES} attempts: {e}")
-            time.sleep(RETRY_DELAY * attempt)
+            time.sleep(wait)
 
     # Parse response
     try:
@@ -299,61 +338,204 @@ def pull_eia(series_id: str, name: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 
-def pull_yfinance(ticker: str, name: str, start: str, end: str) -> pd.DataFrame:
+def pull_stooq(name: str, start: str, end: str) -> pd.DataFrame:
     """
-    Pull daily OHLCV data from Yahoo Finance.
+    Pull daily OHLCV data from Stooq (stooq.com).
+
+    Stooq is used for WEAT because yfinance cannot retrieve it after WEAT's
+    Nov 2025 reverse split changed its CUSIP number. Stooq serves the same
+    WEAT ETF data reliably, requires no API key, and is queried via a plain
+    CSV download URL.
+
+    URL format: https://stooq.com/q/d/l/?s=<ticker>&d1=<YYYYMMDD>&d2=<YYYYMMDD>&i=d
+      s   = ticker symbol (lowercase, with .us suffix for US securities)
+      d1  = start date in YYYYMMDD format
+      d2  = end date in YYYYMMDD format
+      i=d = daily interval
 
     Args:
-        ticker: Yahoo Finance ticker e.g. 'WEAT'
-        name:   Commodity name for storage e.g. 'weat'
-        start:  ISO start date
-        end:    ISO end date
+        name:  Logical commodity name — must be a key in STOOQ_CONFIG e.g. 'weat'
+        start: ISO start date e.g. '2015-01-01'
+        end:   ISO end date   e.g. '2026-05-30'
 
     Returns:
         DataFrame with DatetimeIndex and columns: open, high, low, close, volume
         Saved to bronze/yfinance/{name}_raw.parquet
+
+    Raises:
+        KeyError:     if name is not in STOOQ_CONFIG
+        RuntimeError: if all retry attempts are exhausted
+        ValueError:   if Stooq returns an empty or malformed response
     """
-    logger.info(f"Pulling yfinance: {name} ({ticker})")
+    ticker = STOOQ_CONFIG[name]
+    logger.info(f"Pulling Stooq: {name} ({ticker})")
+
+    # Stooq date format: YYYYMMDD (no dashes)
+    d1 = start.replace("-", "")
+    d2 = end.replace("-", "")
+    url = f"https://stooq.com/q/d/l/?s={ticker}&d1={d1}&d2={d2}&i=d"
+
+    last_error: Exception | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            raw = yf.download(
+            # pandas read_csv pulls the CSV directly from the URL
+            df = pd.read_csv(url, parse_dates=["Date"])
+
+            if df.empty:
+                raise ValueError(f"Stooq returned empty CSV for {ticker}")
+
+            # Stooq returns titled columns: Date, Open, High, Low, Close, Volume
+            df = df.rename(columns=str.lower)
+            df = df.set_index("date").sort_index()
+
+            required_cols = {"open", "high", "low", "close", "volume"}
+            missing_cols  = required_cols - set(df.columns)
+            if missing_cols:
+                raise ValueError(
+                    f"Stooq response for {ticker} missing columns: {missing_cols}. "
+                    f"Got: {df.columns.tolist()}"
+                )
+
+            df = df[["open", "high", "low", "close", "volume"]].copy()
+
+            # Normalize index to timezone-naive dates
+            df.index = pd.to_datetime(df.index).normalize()
+            df.index = df.index.tz_localize(None)
+            df.index.name = "date"
+
+            logger.info(
+                f"Stooq {name} ({ticker}): {len(df)} records | "
+                f"{df.index.min().date()} → {df.index.max().date()}"
+            )
+
+            # Store in the same bronze/yfinance/ path as the other agricultural
+            # sources — downstream code (build_silver) doesn't care about the
+            # original data provider, only the logical commodity name
+            save_bronze(df, source="yfinance", name=name)
+            return df
+
+        except Exception as exc:
+            last_error = exc
+            wait = (BASE_RETRY_DELAY ** attempt) + random.uniform(0, 1)
+            logger.warning(
+                f"Stooq {ticker} attempt {attempt}/{MAX_RETRIES} failed: {exc}. "
+                f"Waiting {wait:.1f}s before retry..."
+            )
+            if attempt < MAX_RETRIES:
+                time.sleep(wait)
+
+    raise RuntimeError(
+        f"Stooq pull failed for '{name}' ({ticker}) after {MAX_RETRIES} attempts. "
+        f"Last error: {last_error}"
+    )
+
+
+def pull_yfinance(name: str, start: str, end: str) -> pd.DataFrame:
+    """
+    Pull daily OHLCV data from Yahoo Finance via yfinance.
+
+    Used for CORN only. WEAT is handled by pull_stooq() due to a permanent
+    yfinance failure caused by WEAT's Nov 2025 reverse split CUSIP change.
+
+    Args:
+        name:  Logical commodity name — must be a key in YFINANCE_CONFIG
+               e.g. 'corn'
+        start: ISO start date
+        end:   ISO end date
+
+    Returns:
+        DataFrame with DatetimeIndex and columns: open, high, low, close, volume
+        Saved to bronze/yfinance/{name}_raw.parquet
+
+    Raises:
+        KeyError:     if name is not in YFINANCE_CONFIG
+        RuntimeError: if all retry attempts are exhausted
+    """
+    ticker = YFINANCE_CONFIG[name]
+    logger.info(f"Pulling yfinance: {name} ({ticker})")
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # Small jitter before each attempt — prevents hammering Yahoo's
+            # servers when pulling multiple tickers in quick succession
+            time.sleep(random.uniform(0.5, 2.0))
+
+            df = yf.download(
                 tickers=ticker,
                 start=start,
                 end=end,
                 interval="1d",
-                auto_adjust=True,   # adjusts for splits and dividends
+                auto_adjust=True,   # adjusts prices for dividends and splits
+                back_adjust=True,   # retroactively rescales ALL historical prices
+                                    # so log returns across past split dates are
+                                    # economically correct (no fake volatility spikes)
                 progress=False,
+                timeout=30,
             )
-            if raw.empty:
+
+            if df.empty:
                 raise ValueError(f"yfinance returned empty DataFrame for {ticker}")
-            break
-        except Exception as e:
-            logger.warning(f"yfinance attempt {attempt}/{MAX_RETRIES} failed: {e}")
-            if attempt == MAX_RETRIES:
-                raise RuntimeError(f"yfinance pull failed after {MAX_RETRIES} attempts: {e}")
-            time.sleep(RETRY_DELAY * attempt)
 
-    # yfinance returns MultiIndex columns when auto_adjust=True — flatten them
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = [col[0].lower() for col in raw.columns]
-    else:
-        raw.columns = [col.lower() for col in raw.columns]
+            # yfinance with auto_adjust returns MultiIndex columns:
+            #   ('Close', 'CORN'), ('Open', 'CORN'), ...
+            # Flatten to plain lowercase: 'close', 'open', ...
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[0].lower() for col in df.columns]
+            else:
+                df.columns = [col.lower() for col in df.columns]
 
-    # Keep only what we need
-    keep = [c for c in ["open", "high", "low", "close", "volume"] if c in raw.columns]
-    df = raw[keep].copy()
+            required_cols = {"open", "high", "low", "close", "volume"}
+            missing_cols  = required_cols - set(df.columns)
+            if missing_cols:
+                raise ValueError(
+                    f"yfinance response for {ticker} missing columns: {missing_cols}. "
+                    f"Got: {df.columns.tolist()}"
+                )
 
-    # Normalize index to timezone-naive
-    df.index = pd.to_datetime(df.index).normalize()
-    df.index = df.index.tz_localize(None)
-    df.index.name = "date"
+            df = df[["open", "high", "low", "close", "volume"]].copy()
 
-    logger.info(f"yfinance {name}: {len(df)} records | {df.index.min().date()} → {df.index.max().date()}")
+            # Normalize index to timezone-naive dates
+            df.index = pd.to_datetime(df.index).normalize()
+            df.index = df.index.tz_localize(None)
+            df.index.name = "date"
 
-    save_bronze(df, source="yfinance", name=name)
+            logger.info(
+                f"yfinance {name} ({ticker}): {len(df)} records | "
+                f"{df.index.min().date()} → {df.index.max().date()}"
+            )
 
-    return df
+            save_bronze(df, source="yfinance", name=name)
+            return df
+
+        except Exception as exc:
+            last_error = exc
+            # Detect 429 rate-limit — wait much longer in that case
+            msg = str(exc).lower()
+            is_rate_limit = any(k in msg for k in ["429", "too many requests", "rate limit"])
+
+            if is_rate_limit:
+                wait = ((BASE_RETRY_DELAY ** attempt) + random.uniform(0, 1)) * RATE_LIMIT_MULTIPLIER
+                logger.warning(
+                    f"Rate limited (429) on {ticker} attempt {attempt}/{MAX_RETRIES}. "
+                    f"Waiting {wait:.1f}s..."
+                )
+            else:
+                wait = (BASE_RETRY_DELAY ** attempt) + random.uniform(0, 1)
+                logger.warning(
+                    f"yfinance {ticker} attempt {attempt}/{MAX_RETRIES} failed: {exc}. "
+                    f"Waiting {wait:.1f}s..."
+                )
+
+            if attempt < MAX_RETRIES:
+                time.sleep(wait)
+
+    raise RuntimeError(
+        f"yfinance pull failed for '{name}' ({ticker}) after {MAX_RETRIES} attempts. "
+        f"Last error: {last_error}"
+    )
 
 
 def pull_fred(series_id: str, name: str, start: str, end: str) -> pd.DataFrame:
@@ -391,10 +573,11 @@ def pull_fred(series_id: str, name: str, start: str, end: str) -> pd.DataFrame:
                 raise ValueError(f"FRED returned empty series for {series_id}")
             break
         except Exception as e:
-            logger.warning(f"FRED attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            wait = (BASE_RETRY_DELAY ** attempt) + random.uniform(0, 1)
+            logger.warning(f"FRED attempt {attempt}/{MAX_RETRIES} failed: {e}. Retrying in {wait:.1f}s...")
             if attempt == MAX_RETRIES:
                 raise RuntimeError(f"FRED pull failed after {MAX_RETRIES} attempts: {e}")
-            time.sleep(RETRY_DELAY * attempt)
+            time.sleep(wait)
 
     df = series.to_frame(name="value")
     df.index = pd.to_datetime(df.index).normalize()
@@ -418,9 +601,9 @@ def pull_fred(series_id: str, name: str, start: str, end: str) -> pd.DataFrame:
 # =============================================================================
 
 def build_silver(
-    eia_data:     dict[str, pd.DataFrame],
-    yfinance_data: dict[str, pd.DataFrame],
-    fred_data:    dict[str, pd.DataFrame],
+    eia_data:        dict[str, pd.DataFrame],
+    yfinance_data:   dict[str, pd.DataFrame],
+    fred_data:       dict[str, pd.DataFrame],
     master_calendar: pd.DatetimeIndex,
 ) -> pd.DataFrame:
     """
@@ -474,8 +657,29 @@ def build_silver(
 # GREAT EXPECTATIONS VALIDATION
 # =============================================================================
 
+def _manual_validate_silver(df: pd.DataFrame) -> None:
+    """Fallback validation for environments where Great Expectations cannot import."""
+    price_cols = ["wti", "natgas", "weat_close", "corn_close", "dxy", "yield_10y"]
+    price_cols = [c for c in price_cols if c in df.columns]
+
+    for col in price_cols:
+        if df[col].isna().any():
+            raise ValueError(f"Validation failed: {col} contains null values")
+
+    for col in ["wti", "natgas", "weat_close", "corn_close"]:
+        if col in df.columns and (df[col] <= 0).any():
+            raise ValueError(f"Validation failed: {col} must be strictly positive")
+
+    if "dxy" in df.columns and ((df["dxy"] < 50.0) | (df["dxy"] > 200.0)).any():
+        raise ValueError("Validation failed: dxy is outside the expected 50.0-200.0 range")
+
+    if "yield_10y" in df.columns and ((df["yield_10y"] < 0.0) | (df["yield_10y"] > 25.0)).any():
+        raise ValueError("Validation failed: yield_10y is outside the expected 0.0-25.0 range")
+
+    logger.info("Built-in silver validation PASSED")
+
+
 def validate_silver(df: pd.DataFrame) -> bool:
-  
     logger.info("Running Great Expectations validation on silver layer")
 
     # --- Pre-GX checks (structural, not column-level) ---
@@ -494,7 +698,15 @@ def validate_silver(df: pd.DataFrame) -> bool:
         logger.warning(f"Date gaps > 5 days found near: {gap_dates}")
         # Warning only — some years have extended closures (e.g. 9/11 2001)
 
-    # --- GX column-level validation ---
+    # --- Column-level validation ---
+    if gx is None:
+        logger.warning(
+            "Great Expectations import failed; using built-in validation instead: {}",
+            GX_IMPORT_ERROR,
+        )
+        _manual_validate_silver(df)
+        return True
+
     price_cols = ["wti", "natgas", "weat_close", "corn_close", "dxy", "yield_10y"]
     price_cols = [c for c in price_cols if c in df.columns]
 
@@ -543,8 +755,8 @@ def validate_silver(df: pd.DataFrame) -> bool:
         )
 
     # Run validation
-    ds       = context.data_sources.add_pandas("silver_ds")
-    da       = ds.add_dataframe_asset("silver_asset")
+    ds        = context.data_sources.add_pandas("silver_ds")
+    da        = ds.add_dataframe_asset("silver_asset")
     batch_def = da.add_batch_definition_whole_dataframe("silver_batch")
 
     vd = context.validation_definitions.add(
@@ -560,11 +772,7 @@ def validate_silver(df: pd.DataFrame) -> bool:
     if result.success:
         logger.info("Great Expectations validation PASSED — all checks clean")
     else:
-        # Extract failed expectations for clear error reporting
-        failed = [
-            r for r in result.results
-            if not r.success
-        ]
+        failed    = [r for r in result.results if not r.success]
         error_msgs = [str(f.expectation_config) for f in failed[:5]]
         raise ValueError(
             f"Great Expectations validation FAILED — {len(failed)} checks failed:\n"
@@ -582,7 +790,7 @@ def print_summary(df: pd.DataFrame) -> None:
     print("\n" + "=" * 65)
     print("  INGESTION COMPLETE — SILVER LAYER SUMMARY")
     print("=" * 65)
-    print(f"  Date range : {df.index.min().date()} → {df.index.max().date()}")
+    print(f"  Date range  : {df.index.min().date()} → {df.index.max().date()}")
     print(f"  Trading days: {len(df)}")
     print(f"  Columns     : {df.shape[1]}")
     print()
@@ -642,7 +850,7 @@ def run_ingestion(start: str, end: str, dry_run: bool = False) -> pd.DataFrame:
     # Step 3: Pull all data sources → bronze
     # -------------------------------------------------------------------------
     logger.info("--- Pulling EIA (energy prices) ---")
-    eia_data = {}
+    eia_data: dict[str, pd.DataFrame] = {}
     for name, series_id in EIA_SERIES.items():
         try:
             eia_data[name] = pull_eia(series_id, name, start, end)
@@ -650,17 +858,27 @@ def run_ingestion(start: str, end: str, dry_run: bool = False) -> pd.DataFrame:
             logger.error(f"Failed to pull EIA {name}: {e}")
             raise
 
-    logger.info("--- Pulling yfinance (agricultural ETFs) ---")
-    yfinance_data = {}
-    for name, ticker in YFINANCE_TICKERS.items():
+    logger.info("--- Pulling agricultural prices (Stooq + yfinance) ---")
+    yfinance_data: dict[str, pd.DataFrame] = {}
+
+    # WEAT → Stooq (yfinance permanently broken due to Nov 2025 CUSIP change)
+    for name in STOOQ_CONFIG:
         try:
-            yfinance_data[name] = pull_yfinance(ticker, name, start, end)
+            yfinance_data[name] = pull_stooq(name, start, end)
+        except Exception as e:
+            logger.error(f"Failed to pull Stooq {name}: {e}")
+            raise
+
+    # CORN → yfinance (working cleanly after upgrade)
+    for name in YFINANCE_CONFIG:
+        try:
+            yfinance_data[name] = pull_yfinance(name, start, end)
         except Exception as e:
             logger.error(f"Failed to pull yfinance {name}: {e}")
             raise
 
     logger.info("--- Pulling FRED (macro features) ---")
-    fred_data = {}
+    fred_data: dict[str, pd.DataFrame] = {}
     for name, series_id in FRED_SERIES.items():
         try:
             fred_data[name] = pull_fred(series_id, name, start, end)
