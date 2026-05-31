@@ -541,27 +541,30 @@ def build_silver(
     for name, df in fred_data.items():
         aligned[name] = align_to_calendar(df["value"], master_calendar, name)
 
-    # FRED publication lag fix — macro series (DXY, yield) are published with
-    # a 1-3 day delay. The most recent trading days will have NaN at the tail
-    # because forward-fill has nothing ahead to propagate from.
-    # Backfill up to 3 days at the tail: carry the last known value forward.
-    # Economically sound — macro rates don't move materially in 1-2 days.
+    # FRED publication lag fix — DXY and yield are published 1-3 days late.
+    # align_to_calendar already ran ffill(limit=3) for mid-series gaps, but
+    # that cannot fill a NaN at the very last row because ffill propagates
+    # forward and there is no value beyond the final row to anchor from.
+    # Run ffill(limit=5) again on the aligned column to carry the last
+    # known macro value into the 1-2 unpublished tail days.
+    # Economically sound: DXY and 10Y yield don't move materially over
+    # 1-2 days. Leaving NaN would break validation and downstream features.
     fred_cols = list(fred_data.keys())
     for col in fred_cols:
         if col in aligned.columns:
             n_tail_nans = aligned[col].isna().sum()
             if n_tail_nans > 0:
-                aligned[col] = aligned[col].bfill(limit=3)
+                aligned[col] = aligned[col].ffill(limit=5)
                 still_nan = aligned[col].isna().sum()
                 if still_nan == 0:
                     logger.info(
-                        f"{col}: {n_tail_nans} tail NaN(s) resolved via bfill "
+                        f"{col}: {n_tail_nans} tail NaN(s) resolved via ffill "
                         f"(FRED publication lag)"
                     )
                 else:
                     logger.warning(
-                        f"{col}: {still_nan} NaN(s) remain after bfill — "
-                        f"gap exceeds 3 days, manual inspection required"
+                        f"{col}: {still_nan} NaN(s) remain after ffill — "
+                        f"gap exceeds 5 days, manual inspection required"
                     )
 
     # Summary
@@ -589,7 +592,7 @@ def _manual_validate_silver(df: pd.DataFrame) -> None:
       Macro columns (dxy, yield_10y):
         - NaNs emit a WARNING rather than raising — FRED publishes with a
           1-3 day lag so the tail of the series may have 1-2 unfilled rows
-          even after bfill. A single tail NaN does not invalidate the dataset.
+          even after ffill. A single tail NaN does not invalidate the dataset.
         - Range checks still apply (hard fail if value is economically impossible)
     """
     # --- Price columns: zero tolerance for NaNs ---
@@ -601,11 +604,25 @@ def _manual_validate_silver(df: pd.DataFrame) -> None:
                 f"Validation failed: {col} contains {n_nan} null value(s). "
                 f"Price columns must be fully populated."
             )
+
+    # WTI-specific note: negative prices ARE valid for WTI.
+    # On April 20 2020, WTI front-month futures settled at -$37.63/bbl —
+    # the only negative close in history, caused by COVID storage constraints.
+    # We check for negative prices in agricultural/natgas only, not WTI.
+    non_negative_cols = ["natgas", "weat_close", "corn_close"]
+    for col in [c for c in non_negative_cols if c in df.columns]:
         if (df[col] <= 0).any():
             raise ValueError(
                 f"Validation failed: {col} must be strictly positive — "
                 f"found {(df[col] <= 0).sum()} non-positive value(s)."
             )
+
+    # WTI: only reject values below a floor that would indicate a data error
+    # (e.g. -$500 would be a parse error, not a real price)
+    if "wti" in df.columns and (df["wti"] < -500).any():
+        raise ValueError(
+            "Validation failed: wti contains values below -$500 — likely a data error"
+        )
 
     # --- Macro columns: warn on NaNs, hard-fail on impossible ranges ---
     macro_cols = ["dxy", "yield_10y"]
