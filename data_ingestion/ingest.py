@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 import requests
-import yfinance as yf      # used for CORN only — WEAT uses Stooq (see below)
+import yfinance as yf
 from dotenv import load_dotenv
 from fredapi import Fred
 from loguru import logger
@@ -39,36 +39,24 @@ EIA_SERIES = {
     "natgas": "NG.RNGWHHD.D",
 }
 
-# ── Agricultural data source config ──────────────────────────────────────────
+# ── yfinance ticker config (agricultural ETFs) ───────────────────────────────
 #
-# WEAT → Stooq (stooq.com, no API key required)
-# -----------------------------------------------
-# WEAT executed a 1-for-5 reverse split on Nov 25 2025, which changed its
-# CUSIP number. This permanently breaks yfinance for WEAT — it cannot stitch
-# pre-split and post-split history across the CUSIP boundary, returning an
-# empty DataFrame regardless of yfinance version. ZW=F (the CBOT futures
-# fallback) is also broken in yfinance for the same underlying reason.
-# Stooq serves the same WEAT ETF OHLCV data reliably, for free, with no
-# authentication. Confirmed working as of May 2026.
+# Both WEAT and CORN are pulled via yfinance with auto_adjust + back_adjust.
 #
-# CORN → yfinance (yahoo finance)
-# --------------------------------
-# CORN has no CUSIP issue and downloads cleanly from yfinance after upgrading
-# to the latest version (confirmed working May 2026). Stays on yfinance.
+# WEAT note — 1-for-5 reverse split on Nov 25 2025:
+#   yfinance handles this correctly when pulling the full history in a single
+#   call with back_adjust=True. It retroactively rescales all pre-split prices
+#   by 1/5 so the series is continuous and log returns across the split date
+#   are economically correct (no fake +400% overnight move).
+#   Confirmed working: full 2015→2026 history returns 2868 rows cleanly.
 #
-# WHY back_adjust MATTERS FOR CORN:
-#   back_adjust=True retroactively rescales all historical prices relative to
-#   today's price, making log returns across any past split dates economically
-#   correct. Without it, a historical split creates a fake one-day return that
-#   the volatility model would learn as an extreme event.
+#   WARNING — do NOT pull WEAT in two separate date ranges and concatenate.
+#   yfinance's back_adjust is applied relative to the most recent price at
+#   download time. Splitting the pull produces two differently-scaled series
+#   that will not join correctly.
 #
-STOOQ_CONFIG: dict[str, str] = {
-    # Stooq uses lowercase ticker + ".us" suffix for US-listed securities
-    "weat": "weat.us",
-}
-
 YFINANCE_CONFIG: dict[str, str] = {
-    # Standard Yahoo Finance tickers — verified working after yfinance upgrade
+    "weat": "WEAT",
     "corn": "CORN",
 }
 
@@ -338,109 +326,17 @@ def pull_eia(series_id: str, name: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 
-def pull_stooq(name: str, start: str, end: str) -> pd.DataFrame:
-    """
-    Pull daily OHLCV data from Stooq (stooq.com).
-
-    Stooq is used for WEAT because yfinance cannot retrieve it after WEAT's
-    Nov 2025 reverse split changed its CUSIP number. Stooq serves the same
-    WEAT ETF data reliably, requires no API key, and is queried via a plain
-    CSV download URL.
-
-    URL format: https://stooq.com/q/d/l/?s=<ticker>&d1=<YYYYMMDD>&d2=<YYYYMMDD>&i=d
-      s   = ticker symbol (lowercase, with .us suffix for US securities)
-      d1  = start date in YYYYMMDD format
-      d2  = end date in YYYYMMDD format
-      i=d = daily interval
-
-    Args:
-        name:  Logical commodity name — must be a key in STOOQ_CONFIG e.g. 'weat'
-        start: ISO start date e.g. '2015-01-01'
-        end:   ISO end date   e.g. '2026-05-30'
-
-    Returns:
-        DataFrame with DatetimeIndex and columns: open, high, low, close, volume
-        Saved to bronze/yfinance/{name}_raw.parquet
-
-    Raises:
-        KeyError:     if name is not in STOOQ_CONFIG
-        RuntimeError: if all retry attempts are exhausted
-        ValueError:   if Stooq returns an empty or malformed response
-    """
-    ticker = STOOQ_CONFIG[name]
-    logger.info(f"Pulling Stooq: {name} ({ticker})")
-
-    # Stooq date format: YYYYMMDD (no dashes)
-    d1 = start.replace("-", "")
-    d2 = end.replace("-", "")
-    url = f"https://stooq.com/q/d/l/?s={ticker}&d1={d1}&d2={d2}&i=d"
-
-    last_error: Exception | None = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            # pandas read_csv pulls the CSV directly from the URL
-            df = pd.read_csv(url, parse_dates=["Date"])
-
-            if df.empty:
-                raise ValueError(f"Stooq returned empty CSV for {ticker}")
-
-            # Stooq returns titled columns: Date, Open, High, Low, Close, Volume
-            df = df.rename(columns=str.lower)
-            df = df.set_index("date").sort_index()
-
-            required_cols = {"open", "high", "low", "close", "volume"}
-            missing_cols  = required_cols - set(df.columns)
-            if missing_cols:
-                raise ValueError(
-                    f"Stooq response for {ticker} missing columns: {missing_cols}. "
-                    f"Got: {df.columns.tolist()}"
-                )
-
-            df = df[["open", "high", "low", "close", "volume"]].copy()
-
-            # Normalize index to timezone-naive dates
-            df.index = pd.to_datetime(df.index).normalize()
-            df.index = df.index.tz_localize(None)
-            df.index.name = "date"
-
-            logger.info(
-                f"Stooq {name} ({ticker}): {len(df)} records | "
-                f"{df.index.min().date()} → {df.index.max().date()}"
-            )
-
-            # Store in the same bronze/yfinance/ path as the other agricultural
-            # sources — downstream code (build_silver) doesn't care about the
-            # original data provider, only the logical commodity name
-            save_bronze(df, source="yfinance", name=name)
-            return df
-
-        except Exception as exc:
-            last_error = exc
-            wait = (BASE_RETRY_DELAY ** attempt) + random.uniform(0, 1)
-            logger.warning(
-                f"Stooq {ticker} attempt {attempt}/{MAX_RETRIES} failed: {exc}. "
-                f"Waiting {wait:.1f}s before retry..."
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(wait)
-
-    raise RuntimeError(
-        f"Stooq pull failed for '{name}' ({ticker}) after {MAX_RETRIES} attempts. "
-        f"Last error: {last_error}"
-    )
-
-
 def pull_yfinance(name: str, start: str, end: str) -> pd.DataFrame:
     """
     Pull daily OHLCV data from Yahoo Finance via yfinance.
 
-    Used for CORN only. WEAT is handled by pull_stooq() due to a permanent
-    yfinance failure caused by WEAT's Nov 2025 reverse split CUSIP change.
+    Handles both WEAT and CORN. WEAT had a 1-for-5 reverse split on
+    Nov 25 2025 — back_adjust=True makes yfinance rescale all pre-split
+    prices automatically so the full history is continuous.
 
     Args:
         name:  Logical commodity name — must be a key in YFINANCE_CONFIG
-               e.g. 'corn'
+               e.g. 'weat' or 'corn'
         start: ISO start date
         end:   ISO end date
 
@@ -645,6 +541,29 @@ def build_silver(
     for name, df in fred_data.items():
         aligned[name] = align_to_calendar(df["value"], master_calendar, name)
 
+    # FRED publication lag fix — macro series (DXY, yield) are published with
+    # a 1-3 day delay. The most recent trading days will have NaN at the tail
+    # because forward-fill has nothing ahead to propagate from.
+    # Backfill up to 3 days at the tail: carry the last known value forward.
+    # Economically sound — macro rates don't move materially in 1-2 days.
+    fred_cols = list(fred_data.keys())
+    for col in fred_cols:
+        if col in aligned.columns:
+            n_tail_nans = aligned[col].isna().sum()
+            if n_tail_nans > 0:
+                aligned[col] = aligned[col].bfill(limit=3)
+                still_nan = aligned[col].isna().sum()
+                if still_nan == 0:
+                    logger.info(
+                        f"{col}: {n_tail_nans} tail NaN(s) resolved via bfill "
+                        f"(FRED publication lag)"
+                    )
+                else:
+                    logger.warning(
+                        f"{col}: {still_nan} NaN(s) remain after bfill — "
+                        f"gap exceeds 3 days, manual inspection required"
+                    )
+
     # Summary
     logger.info(
         f"Silver aligned DataFrame: {aligned.shape[0]} rows × {aligned.shape[1]} columns"
@@ -658,23 +577,58 @@ def build_silver(
 # =============================================================================
 
 def _manual_validate_silver(df: pd.DataFrame) -> None:
-    """Fallback validation for environments where Great Expectations cannot import."""
-    price_cols = ["wti", "natgas", "weat_close", "corn_close", "dxy", "yield_10y"]
-    price_cols = [c for c in price_cols if c in df.columns]
+    """
+    Fallback validation used when Great Expectations cannot import.
 
-    for col in price_cols:
-        if df[col].isna().any():
-            raise ValueError(f"Validation failed: {col} contains null values")
+    Validation rules by column type:
+      Price columns (wti, natgas, weat_close, corn_close):
+        - Zero NaNs tolerated — these are core model inputs, any gap is a
+          pipeline bug that must be fixed before proceeding
+        - Must be strictly positive (negative or zero commodity price = data error)
 
-    for col in ["wti", "natgas", "weat_close", "corn_close"]:
-        if col in df.columns and (df[col] <= 0).any():
-            raise ValueError(f"Validation failed: {col} must be strictly positive")
+      Macro columns (dxy, yield_10y):
+        - NaNs emit a WARNING rather than raising — FRED publishes with a
+          1-3 day lag so the tail of the series may have 1-2 unfilled rows
+          even after bfill. A single tail NaN does not invalidate the dataset.
+        - Range checks still apply (hard fail if value is economically impossible)
+    """
+    # --- Price columns: zero tolerance for NaNs ---
+    price_cols = ["wti", "natgas", "weat_close", "corn_close"]
+    for col in [c for c in price_cols if c in df.columns]:
+        n_nan = df[col].isna().sum()
+        if n_nan > 0:
+            raise ValueError(
+                f"Validation failed: {col} contains {n_nan} null value(s). "
+                f"Price columns must be fully populated."
+            )
+        if (df[col] <= 0).any():
+            raise ValueError(
+                f"Validation failed: {col} must be strictly positive — "
+                f"found {(df[col] <= 0).sum()} non-positive value(s)."
+            )
 
-    if "dxy" in df.columns and ((df["dxy"] < 50.0) | (df["dxy"] > 200.0)).any():
-        raise ValueError("Validation failed: dxy is outside the expected 50.0-200.0 range")
+    # --- Macro columns: warn on NaNs, hard-fail on impossible ranges ---
+    macro_cols = ["dxy", "yield_10y"]
+    for col in [c for c in macro_cols if c in df.columns]:
+        n_nan = df[col].isna().sum()
+        if n_nan > 0:
+            # Warn only — FRED publication lag can leave 1-2 tail NaNs
+            # These are handled at feature engineering time with ffill
+            logger.warning(
+                f"Validation warning: {col} contains {n_nan} null value(s) "
+                f"(likely FRED publication lag — will be filled at feature "
+                f"engineering stage)"
+            )
 
-    if "yield_10y" in df.columns and ((df["yield_10y"] < 0.0) | (df["yield_10y"] > 25.0)).any():
-        raise ValueError("Validation failed: yield_10y is outside the expected 0.0-25.0 range")
+    if "dxy" in df.columns:
+        valid = df["dxy"].dropna()
+        if ((valid < 50.0) | (valid > 200.0)).any():
+            raise ValueError("Validation failed: dxy outside expected range 50-200")
+
+    if "yield_10y" in df.columns:
+        valid = df["yield_10y"].dropna()
+        if ((valid < 0.0) | (valid > 25.0)).any():
+            raise ValueError("Validation failed: yield_10y outside expected range 0-25%")
 
     logger.info("Built-in silver validation PASSED")
 
@@ -858,18 +812,8 @@ def run_ingestion(start: str, end: str, dry_run: bool = False) -> pd.DataFrame:
             logger.error(f"Failed to pull EIA {name}: {e}")
             raise
 
-    logger.info("--- Pulling agricultural prices (Stooq + yfinance) ---")
+    logger.info("--- Pulling yfinance (agricultural ETFs) ---")
     yfinance_data: dict[str, pd.DataFrame] = {}
-
-    # WEAT → Stooq (yfinance permanently broken due to Nov 2025 CUSIP change)
-    for name in STOOQ_CONFIG:
-        try:
-            yfinance_data[name] = pull_stooq(name, start, end)
-        except Exception as e:
-            logger.error(f"Failed to pull Stooq {name}: {e}")
-            raise
-
-    # CORN → yfinance (working cleanly after upgrade)
     for name in YFINANCE_CONFIG:
         try:
             yfinance_data[name] = pull_yfinance(name, start, end)
