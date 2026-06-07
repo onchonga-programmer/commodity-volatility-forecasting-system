@@ -387,25 +387,7 @@ def add_cross_commodity_features(
 # ---------------------------------------------------------------------------
 
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calendar / time-based features.
-
-    Why do calendar features matter in commodity markets?
-
-    1. Futures expiry: Commodity prices are futures contracts, not spot prices.
-       Each contract has a fixed expiry date. In the ~5 days before expiry,
-       trading concentrates in the expiring contract, causing atypical volatility.
-       We approximate expiry proximity with a crude heuristic (last 5 trading days
-       of each month — real expiry dates vary, but this captures most of the effect).
-
-    2. Day of week: Monday opens often see higher volatility (weekend news, geopolitical
-       events that happened while markets were closed). Friday can see position-squaring.
-
-    3. Month: Energy markets are seasonal — winter demand for heating fuel, summer for
-       agricultural commodities during planting/harvest.
-
-    4. Quarter end: Portfolio rebalancing at quarter end creates unusual flows.
-    """
+  
     df = df.copy()
     idx = df.index
 
@@ -446,45 +428,7 @@ def build_feature_store(
     cross_name: str = "other",
     commodity_name: str = "commodity"
 ) -> pd.DataFrame:
-    """
-    Master function that applies all feature engineering steps in order.
 
-    Steps:
-      1. Compute log returns (foundation of everything)
-      2. Add forward RV targets (what we want to predict)
-      3. Add lagged RV features (most important inputs)
-      4. Add volatility-of-volatility
-      5. Add price momentum
-      6. Add Garman-Klass volatility (requires OHLC)
-      7. Add ATR (requires OHLC)
-      8. Add macro features (optional — requires external series)
-      9. Add cross-commodity features (optional — requires other commodity's RV)
-     10. Add calendar features
-     11. Drop rows with NaN (NaN rows are from rolling windows warming up)
-     12. Save to gold layer
-
-    Parameters
-    ----------
-    commodity_df : pd.DataFrame
-        Must have DatetimeIndex and at minimum a 'close' column.
-        For full features: also 'open', 'high', 'low'.
-    dxy : pd.Series, optional
-        DXY index series. If None, macro features are skipped.
-    treasury_yield : pd.Series, optional
-        10Y yield series. If None, macro features are skipped.
-    cross_rv : pd.Series, optional
-        Another commodity's RV series for cross-commodity features.
-    cross_name : str
-        Label for the cross-commodity feature column.
-    commodity_name : str
-        Used for saving the output CSV file.
-
-    Returns
-    -------
-    pd.DataFrame
-        Full feature store with targets and all features.
-        Rows with NaN dropped (initial warm-up period).
-    """
     logger.info(f"Building feature store for {commodity_name}")
 
     df = commodity_df.copy()
